@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Телемост микшер
+Comment=Управление микрофоном и звуком 4 экземпляров Телемоста
+Exec=python3 %k/../mixer.py
+# После установки поправь Exec на полный путь, например:
+# Exec=python3 /home/YOU/telemost-mixer/mixer.py
+Icon=audio-headphones
+Terminal=false
+Categories=AudioVideo;Utility;
+StartupNotify=true

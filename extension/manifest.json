@@ -1,0 +1,14 @@
+{
+  "manifest_version": 3,
+  "name": "Telemost Mixer Helper",
+  "version": "1.0.0",
+  "description": "Подставляет имя и отключает камеру для telemost-mixer",
+  "content_scripts": [
+    {
+      "matches": ["https://telemost.yandex.ru/*", "https://*.telemost.yandex.ru/*"],
+      "js": ["content.js"],
+      "run_at": "document_start",
+      "all_frames": false
+    }
+  ]
+}
