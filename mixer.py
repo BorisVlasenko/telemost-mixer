@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import signal
 import shutil
 import subprocess
@@ -33,9 +34,21 @@ from PyQt6.QtWidgets import (
 APP_DIR = Path(__file__).resolve().parent
 CHANNELS_FILE = APP_DIR / "channels.json"
 PROFILES_ROOT = Path.home() / ".local" / "share" / "telemost-mixer"
+WP_STREAM_PROPS = Path.home() / ".local" / "state" / "wireplumber" / "stream-properties"
 BROWSER = "yandex-browser"
 POLL_MS = 1000
 LAUNCH_STAGGER_S = 2.5
+# WirePlumber keys mute by application.name. Ordinary Yandex uses "Yandex input",
+# so a mixer mute must not be saved under that name — otherwise the regular
+# browser stays muted after reboot.
+_PERSIST_MUTE_MARKERS = (
+    "Yandex\\sinput",
+    "Chromium\\sinput",
+    "application.name:Yandex=",
+    "TelemostMixer",
+    "telemost-mixer",
+)
+_MUTE_TRUE_RE = re.compile(r'"mute"\s*:\s*true')
 
 BTN = 28  # compact square control size
 
@@ -241,6 +254,68 @@ def set_streams_mute(kind: str, streams: list[StreamState], mute: bool) -> None:
     flag = "1" if mute else "0"
     for stream in streams:
         _run(["pactl", verb, str(stream.index), flag])
+    # Live mute may still apply; do not let WirePlumber remember it for Yandex.
+    clear_persisted_browser_mute()
+
+
+def _is_browser_pid(pid: int) -> bool:
+    try:
+        comm = Path(f"/proc/{pid}/comm").read_text(encoding="utf-8").strip()
+    except OSError:
+        return False
+    return comm in {"yandex_browser", "chrome", "chromium"}
+
+
+def rewrite_stream_properties(text: str) -> str:
+    """Force saved mute=false for browser/mixer stream identities."""
+    out: list[str] = []
+    for line in text.splitlines(keepends=True):
+        if any(marker in line for marker in _PERSIST_MUTE_MARKERS):
+            line = _MUTE_TRUE_RE.sub('"mute":false', line)
+        out.append(line)
+    return "".join(out)
+
+
+def clear_persisted_browser_mute() -> None:
+    path = WP_STREAM_PROPS
+    if not path.is_file():
+        return
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return
+    updated = rewrite_stream_properties(text)
+    if updated == text:
+        return
+    try:
+        path.write_text(updated, encoding="utf-8")
+    except OSError:
+        pass
+
+
+def pids_for_channels(channels: list[ChannelConfig]) -> set[int]:
+    pids: set[int] = set()
+    for channel in channels:
+        pids |= pids_for_profile(channel.profile_dir)
+    return pids
+
+
+def unmute_non_mixer_browser_inputs(channels: list[ChannelConfig]) -> None:
+    """Unmute ordinary Yandex/Chrome if a previous mixer mute leaked to them."""
+    mixer_pids = pids_for_channels(channels)
+    for index, pid, muted in _parse_pactl_streams("source-outputs"):
+        if not muted or pid in mixer_pids or not _is_browser_pid(pid):
+            continue
+        _run(["pactl", "set-source-output-mute", str(index), "0"])
+    clear_persisted_browser_mute()
+
+
+def release_mixer_mutes(channels: list[ChannelConfig]) -> None:
+    """Undo mixer mutes so they do not stick after exit or closing windows."""
+    pids = pids_for_channels(channels)
+    set_streams_mute("source-outputs", streams_for_pids("source-outputs", pids), False)
+    set_streams_mute("sink-inputs", streams_for_pids("sink-inputs", pids), False)
+    unmute_non_mixer_browser_inputs(channels)
 
 
 def launch_channel(channel: ChannelConfig, *, index: int = 0) -> None:
@@ -262,10 +337,18 @@ def launch_channel(channel: ChannelConfig, *, index: int = 0) -> None:
         "--no-first-run",
         "--no-default-browser-check",
     ]
+    env = os.environ.copy()
+    # Isolate restore identity so solo/mute is not saved as "Yandex input".
+    env["PULSE_PROP_OVERRIDE"] = (
+        f"application.name=TelemostMixer-{channel.id} "
+        f"application.id=telemost-mixer.{channel.id} "
+        f"module-stream-restore.id=telemost-mixer:{channel.id}"
+    )
     if index > 0:
         time.sleep(LAUNCH_STAGGER_S)
     subprocess.Popen(
         cmd,
+        env=env,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
         start_new_session=True,
@@ -404,6 +487,7 @@ class ChannelRow(QWidget):
         )
 
     def close_channel(self) -> None:
+        release_mixer_mutes([self.channel])
         close_channels([self.channel], wait_s=5.0)
         self.set_solo_active(False)
         self.refresh()
@@ -530,6 +614,7 @@ class MixerWindow(QMainWindow):
         self.resize(240, 170)
         self.poll()
         self._setup_tray()
+        unmute_non_mixer_browser_inputs(self.channels)
 
     def _setup_tray(self) -> None:
         if not QSystemTrayIcon.isSystemTrayAvailable():
@@ -586,11 +671,13 @@ class MixerWindow(QMainWindow):
 
     def quit_app(self) -> None:
         self.save_config()
+        release_mixer_mutes(self.channels)
         QApplication.instance().quit()
 
     def poll(self) -> None:
         for row in self.rows:
             row.refresh()
+        clear_persisted_browser_mute()
 
     def save_config(self) -> None:
         for row in self.rows:
@@ -667,6 +754,7 @@ class MixerWindow(QMainWindow):
         threading.Thread(target=_run_launch, daemon=True).start()
 
     def close_all(self) -> None:
+        release_mixer_mutes(self.channels)
         n = close_channels(self.channels)
         self._solo_row = None
         for row in self.rows:
@@ -702,6 +790,7 @@ def main() -> int:
     app.setApplicationName("telemost-mixer")
     app.setQuitOnLastWindowClosed(False)  # keep running in tray
     win = MixerWindow()
+    app.aboutToQuit.connect(lambda: release_mixer_mutes(win.channels))
     win.show()
     return app.exec()
 
