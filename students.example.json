@@ -1,0 +1,16 @@
+{
+  "students": [
+    {
+      "id": 1,
+      "name": "Ученик 1",
+      "alias": "Ученик 1",
+      "url": "https://telemost.yandex.ru/j/XXXXXXXXXXXXXX"
+    },
+    {
+      "id": 2,
+      "name": "Ученик 2",
+      "alias": "Ученик 2",
+      "url": "https://telemost.yandex.ru/j/XXXXXXXXXXXXXX"
+    }
+  ]
+}

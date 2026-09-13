@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compact tray panel to mute mic/sound for 4 Yandex Telemost instances."""
+"""Compact tray panel to mute mic/sound for Yandex Telemost instances."""
 
 from __future__ import annotations
 
@@ -19,13 +19,15 @@ from PyQt6.QtCore import Qt, QTimer, QSize
 from PyQt6.QtGui import QAction, QCloseEvent, QIcon, QPainter, QColor, QPixmap
 from PyQt6.QtWidgets import (
     QApplication,
+    QComboBox,
+    QFileDialog,
     QHBoxLayout,
-    QLineEdit,
     QMainWindow,
     QMenu,
     QMessageBox,
     QPushButton,
     QSizeGrip,
+    QSlider,
     QSystemTrayIcon,
     QVBoxLayout,
     QWidget,
@@ -33,11 +35,12 @@ from PyQt6.QtWidgets import (
 
 APP_DIR = Path(__file__).resolve().parent
 CHANNELS_FILE = APP_DIR / "channels.json"
+STUDENTS_FILE = APP_DIR / "students.json"
 PROFILES_ROOT = Path.home() / ".local" / "share" / "telemost-mixer"
 WP_STREAM_PROPS = Path.home() / ".local" / "state" / "wireplumber" / "stream-properties"
 BROWSER = "yandex-browser"
 POLL_MS = 1000
-LAUNCH_STAGGER_S = 2.5
+DEFAULT_CHANNEL_COUNT = 2
 # WirePlumber keys mute by application.name. Ordinary Yandex uses "Yandex input",
 # so a mixer mute must not be saved under that name — otherwise the regular
 # browser stays muted after reboot.
@@ -51,6 +54,11 @@ _PERSIST_MUTE_MARKERS = (
 _MUTE_TRUE_RE = re.compile(r'"mute"\s*:\s*true')
 
 BTN = 28  # compact square control size
+VOLUME_MIN = 0
+VOLUME_MAX = 150
+VOLUME_DEFAULT = 100
+VOLUME_SLIDER_W = 72
+_VOLUME_PCT_RE = re.compile(r"(\d+)%")
 
 STYLE_ON = (
     f"QPushButton {{ background: #2e7d32; border: none; border-radius: 4px; "
@@ -76,6 +84,29 @@ STYLE_TOOL = (
     "QPushButton { background: #333; color: #eee; border: none; border-radius: 4px; "
     "padding: 4px 8px; min-height: 26px; }"
 )
+STYLE_VOLUME = (
+    "QSlider::groove:horizontal {"
+    "  background: #444; height: 4px; border-radius: 2px;"
+    "}"
+    "QSlider::handle:horizontal {"
+    "  background: #bbb; width: 10px; height: 14px; margin: -5px 0; border-radius: 2px;"
+    "}"
+    "QSlider::sub-page:horizontal {"
+    "  background: #1565c0; height: 4px; border-radius: 2px;"
+    "}"
+)
+
+
+def clamp_volume(value: int | float) -> int:
+    return max(VOLUME_MIN, min(VOLUME_MAX, int(round(value))))
+
+
+@dataclass
+class StudentOption:
+    id: int | str
+    name: str
+    url: str
+    alias: str = ""
 
 
 @dataclass
@@ -83,6 +114,8 @@ class ChannelConfig:
     id: str
     name: str
     url: str
+    volume: int = VOLUME_DEFAULT
+    student_id: int | str | None = None
 
     @property
     def profile_dir(self) -> Path:
@@ -97,6 +130,22 @@ class ChannelConfig:
 class StreamState:
     index: int
     muted: bool
+    volume: int = VOLUME_DEFAULT
+
+
+def _next_channel_id(existing: list[ChannelConfig]) -> str:
+    used = {c.id for c in existing}
+    n = 1
+    while f"ch{n}" in used:
+        n += 1
+    return f"ch{n}"
+
+
+def _blank_channels(count: int = DEFAULT_CHANNEL_COUNT) -> list[ChannelConfig]:
+    return [
+        ChannelConfig(id=f"ch{i}", name="", url="", volume=VOLUME_DEFAULT)
+        for i in range(1, count + 1)
+    ]
 
 
 def load_channels() -> list[ChannelConfig]:
@@ -105,14 +154,26 @@ def load_channels() -> list[ChannelConfig]:
         if example.is_file():
             shutil.copy(example, CHANNELS_FILE)
         else:
-            raise FileNotFoundError(
-                f"Нет {CHANNELS_FILE} и нет channels.example.json"
-            )
+            channels = _blank_channels()
+            save_channels(channels)
+            return channels
     data = json.loads(CHANNELS_FILE.read_text(encoding="utf-8"))
-    return [
-        ChannelConfig(id=c["id"], name=c["name"], url=c["url"])
-        for c in data["channels"]
-    ]
+    raw = data.get("channels") or []
+    if not raw:
+        return _blank_channels()
+    channels: list[ChannelConfig] = []
+    for c in raw:
+        volume = clamp_volume(c.get("volume", VOLUME_DEFAULT))
+        channels.append(
+            ChannelConfig(
+                id=c["id"],
+                name=c.get("name") or "",
+                url=c.get("url") or "",
+                volume=volume,
+                student_id=c.get("student_id"),
+            )
+        )
+    return channels
 
 
 def save_channels(channels: list[ChannelConfig]) -> None:
@@ -122,8 +183,72 @@ def save_channels(channels: list[ChannelConfig]) -> None:
     except (OSError, json.JSONDecodeError):
         data = {}
     data["channels"] = [
-        {"id": c.id, "name": c.name, "url": c.url} for c in channels
+        {
+            "id": c.id,
+            "name": c.name,
+            "url": c.url,
+            "volume": clamp_volume(c.volume),
+            **({"student_id": c.student_id} if c.student_id is not None else {}),
+        }
+        for c in channels
     ]
+    CHANNELS_FILE.write_text(
+        json.dumps(data, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+
+def load_students(path: Path | None = None) -> list[StudentOption]:
+    students_path = path or STUDENTS_FILE
+    if not students_path.is_file():
+        return []
+    try:
+        data = json.loads(students_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []
+    raw = data.get("students") if isinstance(data, dict) else data
+    if not isinstance(raw, list):
+        return []
+    out: list[StudentOption] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        name = (item.get("name") or item.get("alias") or "").strip()
+        url = (item.get("url") or "").strip()
+        sid = item.get("id", name or url)
+        out.append(
+            StudentOption(
+                id=sid,
+                name=name or str(sid),
+                url=url,
+                alias=(item.get("alias") or "").strip(),
+            )
+        )
+    return out
+
+
+def students_file_from_channels_config() -> Path:
+    try:
+        data = json.loads(CHANNELS_FILE.read_text(encoding="utf-8"))
+        raw = (data.get("students_file") or "").strip()
+        if raw:
+            p = Path(raw).expanduser()
+            return p if p.is_absolute() else (APP_DIR / p)
+    except (OSError, json.JSONDecodeError):
+        pass
+    return STUDENTS_FILE
+
+
+def set_students_file_in_config(path: Path) -> None:
+    try:
+        data = json.loads(CHANNELS_FILE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        data = {}
+    try:
+        rel = path.resolve().relative_to(APP_DIR.resolve())
+        data["students_file"] = str(rel)
+    except ValueError:
+        data["students_file"] = str(path.resolve())
     CHANNELS_FILE.write_text(
         json.dumps(data, ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",
@@ -198,21 +323,23 @@ def close_channels(channels: list[ChannelConfig], *, wait_s: float = 8.0) -> int
     return len(all_pids)
 
 
-def _parse_pactl_streams(kind: str) -> list[tuple[int, int, bool]]:
+def _parse_pactl_streams(kind: str) -> list[tuple[int, int, bool, int]]:
     result = _run(["pactl", "list", kind])
     if result.returncode != 0:
         return []
-    streams: list[tuple[int, int, bool]] = []
+    streams: list[tuple[int, int, bool, int]] = []
     index: int | None = None
     pid: int | None = None
     muted: bool | None = None
+    volume: int = VOLUME_DEFAULT
     header = "Sink Input #" if kind == "sink-inputs" else "Source Output #"
 
     def flush() -> None:
-        nonlocal index, pid, muted
+        nonlocal index, pid, muted, volume
         if index is not None and pid is not None and muted is not None:
-            streams.append((index, pid, muted))
+            streams.append((index, pid, muted, volume))
         index, pid, muted = None, None, None
+        volume = VOLUME_DEFAULT
 
     for line in result.stdout.splitlines():
         if line.startswith(header):
@@ -225,6 +352,10 @@ def _parse_pactl_streams(kind: str) -> list[tuple[int, int, bool]]:
         stripped = line.strip()
         if stripped.startswith("Mute:"):
             muted = stripped.split(":", 1)[1].strip().lower() == "yes"
+        elif stripped.startswith("Volume:"):
+            match = _VOLUME_PCT_RE.search(stripped)
+            if match:
+                volume = clamp_volume(int(match.group(1)))
         elif "application.process.id" in stripped:
             value = stripped.split("=", 1)[-1].strip().strip('"')
             try:
@@ -239,8 +370,8 @@ def streams_for_pids(kind: str, pids: set[int]) -> list[StreamState]:
     if not pids:
         return []
     return [
-        StreamState(index=idx, muted=muted)
-        for idx, pid, muted in _parse_pactl_streams(kind)
+        StreamState(index=idx, muted=muted, volume=vol)
+        for idx, pid, muted, vol in _parse_pactl_streams(kind)
         if pid in pids
     ]
 
@@ -256,6 +387,13 @@ def set_streams_mute(kind: str, streams: list[StreamState], mute: bool) -> None:
         _run(["pactl", verb, str(stream.index), flag])
     # Live mute may still apply; do not let WirePlumber remember it for Yandex.
     clear_persisted_browser_mute()
+
+
+def set_streams_volume(streams: list[StreamState], percent: int) -> None:
+    """Set playback (sink-input) volume for streams. Mic streams are not supported."""
+    pct = clamp_volume(percent)
+    for stream in streams:
+        _run(["pactl", "set-sink-input-volume", str(stream.index), f"{pct}%"])
 
 
 def _is_browser_pid(pid: int) -> bool:
@@ -303,7 +441,7 @@ def pids_for_channels(channels: list[ChannelConfig]) -> set[int]:
 def unmute_non_mixer_browser_inputs(channels: list[ChannelConfig]) -> None:
     """Unmute ordinary Yandex/Chrome if a previous mixer mute leaked to them."""
     mixer_pids = pids_for_channels(channels)
-    for index, pid, muted in _parse_pactl_streams("source-outputs"):
+    for index, pid, muted, _vol in _parse_pactl_streams("source-outputs"):
         if not muted or pid in mixer_pids or not _is_browser_pid(pid):
             continue
         _run(["pactl", "set-source-output-mute", str(index), "0"])
@@ -319,6 +457,10 @@ def release_mixer_mutes(channels: list[ChannelConfig]) -> None:
 
 
 def launch_channel(channel: ChannelConfig, *, index: int = 0) -> None:
+    del index  # kept for call-site compatibility; no stagger pause
+    url = (channel.url or "").strip()
+    if not url:
+        return
     profile = channel.profile_dir
     profile.mkdir(parents=True, exist_ok=True)
     for name in ("SingletonLock", "SingletonCookie", "SingletonSocket"):
@@ -332,7 +474,7 @@ def launch_channel(channel: ChannelConfig, *, index: int = 0) -> None:
         BROWSER,
         f"--user-data-dir={profile}",
         f"--class={channel.wm_class}",
-        f"--app={channel.url}",
+        f"--app={url}",
         "--disable-video-capture",
         "--no-first-run",
         "--no-default-browser-check",
@@ -344,8 +486,6 @@ def launch_channel(channel: ChannelConfig, *, index: int = 0) -> None:
         f"application.id=telemost-mixer.{channel.id} "
         f"module-stream-restore.id=telemost-mixer:{channel.id}"
     )
-    if index > 0:
-        time.sleep(LAUNCH_STAGGER_S)
     subprocess.Popen(
         cmd,
         env=env,
@@ -399,25 +539,35 @@ class ChannelRow(QWidget):
         self,
         channel: ChannelConfig,
         on_solo,
+        on_remove_row=None,
+        students: list[StudentOption] | None = None,
         parent: QWidget | None = None,
     ):
         super().__init__(parent)
         self.channel = channel
         self._on_solo = on_solo
+        self._on_remove_row = on_remove_row
+        self._students: list[StudentOption] = list(students or [])
         self._mic_streams: list[StreamState] = []
         self._sound_streams: list[StreamState] = []
         self._solo_active = False
+        self._slider_dragging = False
 
         layout = QHBoxLayout(self)
         layout.setContentsMargins(0, 1, 0, 1)
         layout.setSpacing(3)
 
-        self.name_edit = QLineEdit(channel.name)
-        self.name_edit.setPlaceholderText("ученик")
-        self.name_edit.setMaximumHeight(BTN)
-        # Fits ~«Артемий Савин» without feeling cramped.
-        self.name_edit.setMinimumWidth(110)
-        self.name_edit.editingFinished.connect(self._on_name_changed)
+        self.student_combo = QComboBox()
+        self.student_combo.setMaximumHeight(BTN)
+        self.student_combo.setMinimumWidth(130)
+        self.student_combo.setEditable(False)
+        self.student_combo.setStyleSheet(
+            "QComboBox { background: #2a2a2a; color: #eee; border: 1px solid #555; "
+            "border-radius: 4px; padding: 2px 6px; }"
+            "QComboBox QAbstractItemView { background: #2a2a2a; color: #eee; }"
+        )
+        self._refill_students(select_current=True)
+        self.student_combo.currentIndexChanged.connect(self._on_student_chosen)
 
         self.solo_btn = QPushButton()
         self.solo_btn.setIcon(
@@ -441,9 +591,16 @@ class ChannelRow(QWidget):
         self.close_btn = QPushButton()
         self.close_btn.setIcon(theme_icon(["window-close", "process-stop"], "×"))
         self.close_btn.setIconSize(QSize(14, 14))
-        self.close_btn.setToolTip("Закрыть только этот канал")
+        self.close_btn.setToolTip("Закрыть окно браузера этого канала")
         self.close_btn.setStyleSheet(STYLE_SOLO_IDLE)
         self.close_btn.clicked.connect(self.close_channel)
+
+        self.remove_btn = QPushButton()
+        self.remove_btn.setIcon(theme_icon(["list-remove", "edit-delete"], "−"))
+        self.remove_btn.setIconSize(QSize(14, 14))
+        self.remove_btn.setToolTip("Убрать строку канала из панели")
+        self.remove_btn.setStyleSheet(STYLE_SOLO_IDLE)
+        self.remove_btn.clicked.connect(self._remove_row)
 
         self.mic_btn = QPushButton()
         self.mic_btn.setIcon(
@@ -464,16 +621,140 @@ class ChannelRow(QWidget):
         self.sound_btn.setToolTip("Звук")
         self.sound_btn.clicked.connect(self.toggle_sound)
 
-        layout.addWidget(self.name_edit, stretch=1)
+        self.vol_slider = QSlider(Qt.Orientation.Horizontal)
+        self.vol_slider.setRange(VOLUME_MIN, VOLUME_MAX)
+        self.vol_slider.setSingleStep(5)
+        self.vol_slider.setPageStep(10)
+        self.vol_slider.setValue(clamp_volume(channel.volume))
+        self.vol_slider.setFixedWidth(VOLUME_SLIDER_W)
+        self.vol_slider.setMaximumHeight(BTN)
+        self.vol_slider.setStyleSheet(STYLE_VOLUME)
+        self.vol_slider.setToolTip(f"Громкость: {self.vol_slider.value()}%")
+        self.vol_slider.sliderPressed.connect(self._on_slider_pressed)
+        self.vol_slider.sliderReleased.connect(self._on_slider_released)
+        self.vol_slider.valueChanged.connect(self._on_volume_changed)
+
+        layout.addWidget(self.student_combo, stretch=1)
         layout.addWidget(self.solo_btn)
         layout.addWidget(self.copy_btn)
         layout.addWidget(self.close_btn)
+        layout.addWidget(self.remove_btn)
         layout.addWidget(self.mic_btn)
         layout.addWidget(self.sound_btn)
+        layout.addWidget(self.vol_slider)
         self._paint_buttons()
 
-    def _on_name_changed(self) -> None:
-        self.channel.name = self.name_edit.text().strip() or self.channel.id
+    def set_students(self, students: list[StudentOption]) -> None:
+        self._students = list(students)
+        self._refill_students(select_current=True)
+
+    def _refill_students(self, *, select_current: bool) -> None:
+        combo = self.student_combo
+        combo.blockSignals(True)
+        combo.clear()
+        combo.addItem("— ученик —", None)
+        for st in self._students:
+            label = st.name
+            if not (st.url or "").strip():
+                label = f"{label} (нет ссылки)"
+            combo.addItem(label, st)
+        # Keep free-text name if not in list
+        current_name = (self.channel.name or "").strip()
+        matched = False
+        if select_current:
+            for i in range(1, combo.count()):
+                st = combo.itemData(i)
+                if st is None:
+                    continue
+                if self.channel.student_id is not None and str(st.id) == str(
+                    self.channel.student_id
+                ):
+                    combo.setCurrentIndex(i)
+                    matched = True
+                    break
+                if current_name and st.name == current_name:
+                    combo.setCurrentIndex(i)
+                    matched = True
+                    break
+            if not matched and current_name:
+                # Show current assignment as custom entry
+                custom = StudentOption(
+                    id=self.channel.student_id or current_name,
+                    name=current_name,
+                    url=(self.channel.url or "").strip(),
+                )
+                combo.addItem(current_name, custom)
+                combo.setCurrentIndex(combo.count() - 1)
+                matched = True
+            if not matched:
+                combo.setCurrentIndex(0)
+        combo.blockSignals(False)
+
+    def _on_student_chosen(self, index: int) -> None:
+        st = self.student_combo.itemData(index)
+        if st is None:
+            self.channel.name = ""
+            self.channel.url = ""
+            self.channel.student_id = None
+            return
+        self.channel.name = st.name
+        self.channel.url = (st.url or "").strip()
+        self.channel.student_id = st.id
+
+    def _sync_channel_from_combo(self) -> None:
+        self._on_student_chosen(self.student_combo.currentIndex())
+
+    def _remove_row(self) -> None:
+        if self._on_remove_row:
+            self._on_remove_row(self)
+
+    def _on_slider_pressed(self) -> None:
+        self._slider_dragging = True
+
+    def _on_slider_released(self) -> None:
+        self._slider_dragging = False
+        self._apply_volume(self.vol_slider.value())
+
+    def _on_volume_changed(self, value: int) -> None:
+        pct = clamp_volume(value)
+        self.vol_slider.setToolTip(f"Громкость: {pct}%")
+        self.channel.volume = pct
+        if self._slider_dragging:
+            # Live preview while dragging
+            if self._sound_streams:
+                set_streams_volume(self._sound_streams, pct)
+            return
+        self._apply_volume(pct)
+
+    def _apply_volume(self, percent: int) -> None:
+        pct = clamp_volume(percent)
+        self.channel.volume = pct
+        if self._sound_streams:
+            set_streams_volume(self._sound_streams, pct)
+
+    def _sync_volume_slider(self) -> None:
+        desired = clamp_volume(self.channel.volume)
+        if self.vol_slider.value() != desired:
+            self.vol_slider.blockSignals(True)
+            self.vol_slider.setValue(desired)
+            self.vol_slider.blockSignals(False)
+        self.vol_slider.setToolTip(f"Громкость: {desired}%")
+        has_stream = bool(self._sound_streams)
+        self.vol_slider.setEnabled(has_stream)
+        if not has_stream:
+            self.vol_slider.setToolTip("Громкость: нет потока")
+
+    def _ensure_desired_volume(self) -> None:
+        """Re-apply saved volume when stream appears or drifts (e.g. reconnect)."""
+        if self._slider_dragging or not self._sound_streams:
+            return
+        desired = clamp_volume(self.channel.volume)
+        # Average across streams belonging to this channel profile.
+        current = round(
+            sum(s.volume for s in self._sound_streams) / len(self._sound_streams)
+        )
+        if abs(current - desired) >= 2:
+            set_streams_volume(self._sound_streams, desired)
 
     def copy_link(self) -> None:
         url = (self.channel.url or "").strip()
@@ -500,7 +781,10 @@ class ChannelRow(QWidget):
         pids = pids_for_profile(self.channel.profile_dir)
         self._mic_streams = streams_for_pids("source-outputs", pids)
         self._sound_streams = streams_for_pids("sink-inputs", pids)
+        self._ensure_desired_volume()
         self._paint_buttons()
+        if not self._slider_dragging:
+            self._sync_volume_slider()
 
     def _paint_buttons(self) -> None:
         self._paint_one(self.mic_btn, self._mic_streams, "Микрофон")
@@ -554,24 +838,36 @@ class MixerWindow(QMainWindow):
         self.channels = load_channels()
         self.rows: list[ChannelRow] = []
         self._solo_row: ChannelRow | None = None
+        self._students_path = students_file_from_channels_config()
+        self.students = load_students(self._students_path)
 
         root = QWidget()
         root.setStyleSheet("background: #1e1e1e; color: #eee;")
         self.setCentralWidget(root)
-        layout = QVBoxLayout(root)
-        layout.setContentsMargins(6, 6, 6, 6)
-        layout.setSpacing(3)
+        self._root_layout = QVBoxLayout(root)
+        self._root_layout.setContentsMargins(6, 6, 6, 6)
+        self._root_layout.setSpacing(3)
+
+        self._rows_host = QWidget()
+        self._rows_layout = QVBoxLayout(self._rows_host)
+        self._rows_layout.setContentsMargins(0, 0, 0, 0)
+        self._rows_layout.setSpacing(3)
+        self._root_layout.addWidget(self._rows_host)
 
         for ch in self.channels:
-            row = ChannelRow(ch, on_solo=self.solo_channel)
-            self.rows.append(row)
-            layout.addWidget(row)
+            self._append_row(ch)
+
+        self.btn_add = QPushButton("+ Добавить канал")
+        self.btn_add.setStyleSheet(STYLE_TOOL)
+        self.btn_add.setToolTip("Добавить ещё одну строку канала")
+        self.btn_add.clicked.connect(self.add_channel)
+        self._root_layout.addWidget(self.btn_add)
 
         tools = QHBoxLayout()
         tools.setSpacing(4)
         self.btn_launch = QPushButton("▶")
         self.btn_launch.setStyleSheet(STYLE_TOOL)
-        self.btn_launch.setToolTip("Запустить окна")
+        self.btn_launch.setToolTip("Запустить окна (без пауз между ними)")
         self.btn_launch.setFixedWidth(36)
         self.btn_launch.clicked.connect(self.launch_all)
 
@@ -602,19 +898,61 @@ class MixerWindow(QMainWindow):
         tools.addWidget(
             grip, 0, Qt.AlignmentFlag.AlignBottom | Qt.AlignmentFlag.AlignRight
         )
-        layout.addLayout(tools)
+        self._root_layout.addLayout(tools)
 
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.poll)
         self.timer.start(POLL_MS)
 
-        # Resizable; min width fits «Артемий Савин» + icon buttons.
-        self.setMinimumWidth(220)
-        self.setMinimumHeight(150)
-        self.resize(240, 170)
+        self.setMinimumWidth(340)
+        self.setMinimumHeight(120)
+        self.resize(360, max(160, 40 + 34 * max(2, len(self.rows))))
         self.poll()
         self._setup_tray()
         unmute_non_mixer_browser_inputs(self.channels)
+
+    def _append_row(self, channel: ChannelConfig) -> ChannelRow:
+        row = ChannelRow(
+            channel,
+            on_solo=self.solo_channel,
+            on_remove_row=self.remove_channel_row,
+            students=self.students,
+        )
+        self.rows.append(row)
+        self._rows_layout.addWidget(row)
+        return row
+
+    def add_channel(self) -> None:
+        ch = ChannelConfig(
+            id=_next_channel_id(self.channels),
+            name="",
+            url="",
+            volume=VOLUME_DEFAULT,
+        )
+        self.channels.append(ch)
+        self._append_row(ch)
+        self.save_config()
+        self.resize(
+            max(self.width(), 360),
+            max(self.height(), 40 + 34 * len(self.rows) + 40),
+        )
+
+    def remove_channel_row(self, row: ChannelRow) -> None:
+        if len(self.rows) <= 1:
+            QMessageBox.information(
+                self, "Каналы", "Нужна хотя бы одна строка канала."
+            )
+            return
+        if self._solo_row is row:
+            self._solo_row = None
+        release_mixer_mutes([row.channel])
+        close_channels([row.channel], wait_s=3.0)
+        self.rows.remove(row)
+        if row.channel in self.channels:
+            self.channels.remove(row.channel)
+        self._rows_layout.removeWidget(row)
+        row.deleteLater()
+        self.save_config()
 
     def _setup_tray(self) -> None:
         if not QSystemTrayIcon.isSystemTrayAvailable():
@@ -631,10 +969,12 @@ class MixerWindow(QMainWindow):
         act_launch.triggered.connect(self.launch_all)
         act_close = QAction("Закрыть окна", self)
         act_close.triggered.connect(self.close_all)
-        act_edit = QAction("Редактировать ссылки…", self)
+        act_edit = QAction("Редактировать каналы…", self)
         act_edit.triggered.connect(self.open_channels_file)
-        act_reload = QAction("Перечитать ссылки", self)
+        act_reload = QAction("Перечитать каналы", self)
         act_reload.triggered.connect(self.reload_channels)
+        act_students = QAction("Загрузить список учеников…", self)
+        act_students.triggered.connect(self.load_students_dialog)
         act_quit = QAction("Выйти", self)
         act_quit.triggered.connect(self.quit_app)
         menu.addAction(act_show)
@@ -644,6 +984,7 @@ class MixerWindow(QMainWindow):
         menu.addSeparator()
         menu.addAction(act_edit)
         menu.addAction(act_reload)
+        menu.addAction(act_students)
         menu.addSeparator()
         menu.addAction(act_quit)
         self.tray.setContextMenu(menu)
@@ -681,7 +1022,8 @@ class MixerWindow(QMainWindow):
 
     def save_config(self) -> None:
         for row in self.rows:
-            row._on_name_changed()
+            row._sync_channel_from_combo()
+        self.channels = [row.channel for row in self.rows]
         save_channels(self.channels)
 
     def solo_channel(self, row: ChannelRow) -> None:
@@ -709,8 +1051,52 @@ class MixerWindow(QMainWindow):
         except OSError as exc:
             QMessageBox.warning(self, "Файл", f"Не удалось открыть:\n{path}\n{exc}")
 
+    def load_students_dialog(self) -> None:
+        start = str(self._students_path.parent if self._students_path else APP_DIR)
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Список учеников (JSON с сайта)",
+            start,
+            "JSON (*.json);;All (*)",
+        )
+        if not path:
+            return
+        self.apply_students_file(Path(path))
+
+    def apply_students_file(self, path: Path) -> None:
+        students = load_students(path)
+        if not students:
+            QMessageBox.warning(
+                self,
+                "Ученики",
+                f"В файле нет учеников:\n{path}\n"
+                "Ожидается JSON вида {\"students\": [{\"id\", \"name\", \"url\"}, …]}",
+            )
+            return
+        self._students_path = path
+        self.students = students
+        set_students_file_in_config(path)
+        # Also copy beside mixer for convenience if outside APP_DIR
+        if path.resolve() != STUDENTS_FILE.resolve():
+            try:
+                STUDENTS_FILE.write_text(
+                    path.read_text(encoding="utf-8"),
+                    encoding="utf-8",
+                )
+            except OSError:
+                pass
+        for row in self.rows:
+            row.set_students(students)
+        if hasattr(self, "tray"):
+            self.tray.showMessage(
+                "Телемост микшер",
+                f"Загружено учеников: {len(students)}",
+                QSystemTrayIcon.MessageIcon.Information,
+                2000,
+            )
+
     def reload_channels(self) -> None:
-        """Reload URLs/names from channels.json after manual edit."""
+        """Reload channel list from channels.json after manual edit."""
         try:
             fresh = load_channels()
         except (OSError, json.JSONDecodeError, KeyError) as exc:
@@ -718,19 +1104,20 @@ class MixerWindow(QMainWindow):
                 self, "Конфиг", f"Не удалось прочитать channels.json:\n{exc}"
             )
             return
-        by_id = {c.id: c for c in fresh}
-        for row in self.rows:
-            updated = by_id.get(row.channel.id)
-            if not updated:
-                continue
-            row.channel.name = updated.name
-            row.channel.url = updated.url
-            row.name_edit.setText(updated.name)
-        self.channels = [row.channel for row in self.rows]
+        self._students_path = students_file_from_channels_config()
+        self.students = load_students(self._students_path)
+        # Rebuild rows to match file (count may change)
+        while self.rows:
+            row = self.rows.pop()
+            self._rows_layout.removeWidget(row)
+            row.deleteLater()
+        self.channels = fresh
+        for ch in self.channels:
+            self._append_row(ch)
         if hasattr(self, "tray"):
             self.tray.showMessage(
                 "Телемост микшер",
-                "Ссылки перечитаны из channels.json",
+                "Каналы перечитаны из channels.json",
                 QSystemTrayIcon.MessageIcon.Information,
                 2000,
             )
@@ -742,26 +1129,26 @@ class MixerWindow(QMainWindow):
                 self, "Браузер", f"«{BROWSER}» не найден в PATH."
             )
             return
+        to_launch = [
+            ch
+            for ch in self.channels
+            if (ch.url or "").strip() and not pids_for_profile(ch.profile_dir)
+        ]
+        if not to_launch:
+            return
 
         def _run_launch() -> None:
-            i = 0
-            for ch in self.channels:
-                if pids_for_profile(ch.profile_dir):
-                    continue
+            for i, ch in enumerate(to_launch):
                 launch_channel(ch, index=i)
-                i += 1
 
         threading.Thread(target=_run_launch, daemon=True).start()
 
     def close_all(self) -> None:
         release_mixer_mutes(self.channels)
-        n = close_channels(self.channels)
+        close_channels(self.channels)
         self._solo_row = None
         for row in self.rows:
             row.set_solo_active(False)
-        if n == 0:
-            # silent is fine in compact UI
-            pass
 
     def closeEvent(self, event: QCloseEvent) -> None:
         # Closing the window hides to tray instead of quitting.

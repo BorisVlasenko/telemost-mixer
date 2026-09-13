@@ -1,25 +1,18 @@
 {
   "display_name": "",
+  "students_file": "students.json",
   "channels": [
     {
       "id": "ch1",
-      "name": "Ученик 1",
-      "url": "https://telemost.yandex.ru/j/XXXXXXXXXXXXXX"
+      "name": "",
+      "url": "",
+      "volume": 100
     },
     {
       "id": "ch2",
-      "name": "Ученик 2",
-      "url": "https://telemost.yandex.ru/j/XXXXXXXXXXXXXX"
-    },
-    {
-      "id": "ch3",
-      "name": "Ученик 3",
-      "url": "https://telemost.yandex.ru/j/XXXXXXXXXXXXXX"
-    },
-    {
-      "id": "ch4",
-      "name": "Ученик 4",
-      "url": "https://telemost.yandex.ru/j/XXXXXXXXXXXXXX"
+      "name": "",
+      "url": "",
+      "volume": 100
     }
   ]
 }
