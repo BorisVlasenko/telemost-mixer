@@ -198,6 +198,11 @@ def save_channels(channels: list[ChannelConfig]) -> None:
     )
 
 
+def _name_sort_key(name: str) -> str:
+    """Alphabetical key: case-insensitive, ё sorted with е."""
+    return name.casefold().replace("ё", "е")
+
+
 def load_students(path: Path | None = None) -> list[StudentOption]:
     students_path = path or STUDENTS_FILE
     if not students_path.is_file():
@@ -224,6 +229,7 @@ def load_students(path: Path | None = None) -> list[StudentOption]:
                 alias=(item.get("alias") or "").strip(),
             )
         )
+    out.sort(key=lambda student: _name_sort_key(student.name))
     return out
 
 
